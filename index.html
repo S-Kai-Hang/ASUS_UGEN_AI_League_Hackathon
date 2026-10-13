@@ -1,0 +1,418 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Note Taking Assistant AI</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #f4f4f6; display: flex; height: 100vh; }
+  #left { flex: 2; display: flex; flex-direction: column; padding: 12px; gap: 8px; }
+  #right { flex: 1; padding: 12px; display: flex; flex-direction: column; gap: 8px; border-left: 1px solid #ddd; background: #fff; }
+  #wrap { flex: 1; position: relative; border: 1px solid #ccc; border-radius: 8px; overflow: hidden; background: #fff; }
+  #wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #c { touch-action: none; cursor: crosshair; }
+  #overlay { pointer-events: none; }          /* marks sit on top but don't block the pen */
+  #bar { display: flex; gap: 8px; align-items: center; }
+  button { padding: 8px 14px; border: 0; border-radius: 6px; background: #3b5bdb; color: #fff; font-size: 14px; cursor: pointer; }
+  button.secondary { background: #868e96; }
+  button.tool { background: #e9ecef; color: #333; }
+  button.tool.active { background: #343a40; color: #fff; }
+  button.ai-on { background: #2b8a3e; }
+  button.ai-off { background: #adb5bd; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .sep { width: 1px; height: 24px; background: #ccc; margin: 0 4px; }
+  #c.erasing { cursor: cell; }
+  #status { margin-left: auto; font-weight: 600; }
+  .writing { color: #868e96; } .analyzing { color: #e67700; } .done { color: #2b8a3e; }
+  #feedback { flex: 1; overflow-y: auto; white-space: pre-wrap; font-size: 15px; line-height: 1.5; }
+  .card { background: #f8f9fa; border-left: 4px solid #3b5bdb; padding: 8px 10px; margin-bottom: 10px; border-radius: 4px; }
+  .card.summary { border-color: #2b8a3e; }
+  .card.chart { border-color: #7048e8; }
+  .card.chart .chartbox { position: relative; height: 220px; margin: 6px 0; background: #fff; border-radius: 4px; }  .card.answer { border-color: #3b5bdb; }
+  .card.correction { border-color: #e03131; background: #fff5f5; }
+  .card.ok { border-color: #2b8a3e; color: #2b8a3e; }
+  .card.error { border-color: #868e96; color: #868e96; }
+  .card small { color: #868e96; display: block; margin-bottom: 4px; }
+  .card .kw { display: inline-block; font-weight: 700; margin-bottom: 4px; text-decoration: underline wavy; }
+  .card.correction .kw { color: #e03131; }
+  .card.answer .kw { color: #3b5bdb; }
+  .card.thinking { border-color: #e67700; color: #e67700; font-style: italic; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+  .dots::after { content: ""; animation: dots 1.2s steps(4) infinite; }
+  @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
+</style>
+</head>
+<body>
+  <div id="left">
+    <div id="bar">
+      <button id="pen" class="tool active">✏️ Pen</button>
+      <button id="eraser" class="tool">🧽 Eraser</button>
+      <button id="clear" class="secondary">Clear</button>
+      <span class="sep"></span>
+      <button id="aiToggle" class="ai-on">🤖 AI: ON</button>
+      <button id="summarize">Summarize</button>
+      <span id="status" class="writing">Start writing…</span>
+    </div>
+    <div id="wrap">
+      <canvas id="c"></canvas>          <!-- the user's handwriting (this is what gets sent to the AI) -->
+      <canvas id="overlay"></canvas>    <!-- AI underlines (NOT sent to the AI) -->
+    </div>
+  </div>
+  <div id="right">
+    <h3 style="margin:0">AI Feedback</h3>
+    <div id="feedback"></div>
+  </div>
+
+<script>
+const PAUSE_MS = 5000;                       // how long a pause must be before feedback
+
+const c = document.getElementById("c");
+const ctx = c.getContext("2d");
+const ov = document.getElementById("overlay");
+const octx = ov.getContext("2d");
+const statusEl = document.getElementById("status");
+const feedbackEl = document.getElementById("feedback");
+
+let drawing = false;
+let timer = null;
+let dirty = false;                           // has anything new been drawn since last check?
+let tool = "pen";                            // "pen" or "eraser"
+let aiOn = true;                             // auto-feedback on pause
+
+const PEN_WIDTH = 3;
+const ERASER_WIDTH = 28;
+
+const COLORS = { correction: "#e03131", answer: "#3b5bdb" };
+
+// ---------- Canvas setup ----------
+function resize() {
+  const saved = c.width ? ctx.getImageData(0, 0, c.width, c.height) : null;
+  const savedOv = ov.width ? octx.getImageData(0, 0, ov.width, ov.height) : null;
+  c.width = ov.width = c.clientWidth;
+  c.height = ov.height = c.clientHeight;
+  clearCanvas();
+  if (saved) ctx.putImageData(saved, 0, 0);
+  if (savedOv) octx.putImageData(savedOv, 0, 0);
+}
+function clearCanvas() {
+  ctx.fillStyle = "#fff";                    // white background so the AI sees dark ink on white
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.lineWidth = 3;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = "#111";
+  octx.clearRect(0, 0, ov.width, ov.height);
+}
+window.addEventListener("resize", resize);
+resize();
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls;
+}
+
+// ---------- Drawing + pause timer ----------
+c.addEventListener("pointerdown", e => {
+  drawing = true;
+  clearTimeout(timer);                       // writing again → cancel countdown
+  setStatus(tool === "eraser" ? "Erasing…" : "Writing…", "writing");
+
+  // pen = dark thin line; eraser = thick white line (paints over the ink)
+  ctx.strokeStyle = tool === "eraser" ? "#fff" : "#111";
+  ctx.lineWidth = tool === "eraser" ? ERASER_WIDTH : PEN_WIDTH;
+  ctx.beginPath();
+  ctx.moveTo(e.offsetX, e.offsetY);
+
+  if (tool === "eraser") {                   // also wipe AI underlines in the same spot
+    octx.globalCompositeOperation = "destination-out";
+    octx.lineWidth = ERASER_WIDTH + 10;
+    octx.lineCap = "round";
+    octx.lineJoin = "round";
+    octx.beginPath();
+    octx.moveTo(e.offsetX, e.offsetY);
+  }
+  c.setPointerCapture(e.pointerId);
+});
+
+c.addEventListener("pointermove", e => {
+  if (!drawing) return;
+  ctx.lineTo(e.offsetX, e.offsetY);
+  ctx.stroke();
+  if (tool === "eraser") {
+    octx.lineTo(e.offsetX, e.offsetY);
+    octx.stroke();
+  }
+  dirty = true;
+});
+
+c.addEventListener("pointerup", () => {
+  drawing = false;
+  octx.globalCompositeOperation = "source-over";
+  clearTimeout(timer);
+  if (aiOn) {
+    timer = setTimeout(onPause, PAUSE_MS);   // start fresh countdown
+  } else {
+    setStatus("AI off", "writing");
+  }
+});
+
+function onPause() {
+  if (!aiOn || !dirty) return;               // AI off or nothing new → don't call AI
+  dirty = false;
+  askAI("feedback");
+}
+
+// ---------- Tools ----------
+const penBtn = document.getElementById("pen");
+const eraserBtn = document.getElementById("eraser");
+function setTool(t) {
+  tool = t;
+  penBtn.classList.toggle("active", t === "pen");
+  eraserBtn.classList.toggle("active", t === "eraser");
+  c.classList.toggle("erasing", t === "eraser");
+}
+penBtn.onclick = () => setTool("pen");
+eraserBtn.onclick = () => setTool("eraser");
+
+// ---------- AI on/off ----------
+const aiBtn = document.getElementById("aiToggle");
+const summarizeBtn = document.getElementById("summarize");
+aiBtn.onclick = () => {
+  aiOn = !aiOn;
+  aiBtn.textContent = aiOn ? "🤖 AI: ON" : "🤖 AI: OFF";
+  aiBtn.className = aiOn ? "ai-on" : "ai-off";
+  summarizeBtn.disabled = !aiOn;
+  clearTimeout(timer);
+  if (aiOn) {
+    setStatus("AI on", "done");
+    if (dirty) timer = setTimeout(onPause, PAUSE_MS);   // check what was written while off
+  } else {
+    setStatus("AI off", "writing");
+  }
+};
+
+// ---------- Underline on the overlay ----------
+// box = [left, top, right, bottom] as fractions (0..1) of the canvas size
+function drawUnderline(box, type) {
+  const color = COLORS[type];
+  if (!box || !color) return;
+  const [l, t, r, b] = box;
+  const x1 = l * ov.width, x2 = r * ov.width;
+  const y1 = t * ov.height, y2 = b * ov.height;
+
+  // soft highlight behind the word
+  octx.fillStyle = color + "22";
+  octx.fillRect(x1 - 4, y1 - 4, (x2 - x1) + 8, (y2 - y1) + 8);
+
+  // wavy underline below the word
+  const y = y2 + 8;
+  octx.strokeStyle = color;
+  octx.lineWidth = 3;
+  octx.lineCap = "round";
+  octx.beginPath();
+  octx.moveTo(x1, y);
+  let up = true;
+  for (let x = x1 + 6; x <= x2 + 6; x += 6) {
+    octx.lineTo(x, y + (up ? -4 : 4));
+    up = !up;
+  }
+  octx.stroke();
+}
+
+// ---------- Buttons ----------
+document.getElementById("summarize").onclick = () => {
+  if (!aiOn) return;
+  clearTimeout(timer);
+  askAI("summary");
+};
+document.getElementById("clear").onclick = () => {
+  clearTimeout(timer);
+  clearCanvas();
+  feedbackEl.innerHTML = "";
+  dirty = false;
+  setStatus("Start writing…", "writing");
+};
+
+// ---------- Send to server ----------
+async function askAI(mode) {
+  const WAIT = { summary: "Summarizing", chart: "Making chart", feedback: "Thinking" };
+  setStatus(mode === "feedback" ? "Paused → analyzing…" : WAIT[mode] + "…", "analyzing");
+  const image = c.toDataURL("image/png");    // only the handwriting, not the underlines
+
+  // show a "Thinking..." card right away, then replace it with the answer
+  const card = document.createElement("div");
+  card.className = "card thinking";
+  card.innerHTML = `<span class="dots">${WAIT[mode] || "Thinking"}</span>`;
+  feedbackEl.prepend(card);
+
+  try {
+    const res = await fetch("/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image, mode })
+    });
+    const data = await res.json();
+    if (data.type === "none") {               // unreadable / nothing to say → remove quietly
+      card.remove();
+      setStatus("Writing…", "writing");
+      return;
+    }
+    if (data.type === "chart") {
+      fillChart(card, data.chart, data.text);
+    } else {
+      fillCard(card, data.type, data.text || "No response", data.keyword);
+      drawUnderline(data.box, data.type);
+    }
+    setStatus("Feedback ✓", "done");
+  } catch (err) {
+    fillCard(card, "error", "Error: " + err.message);
+    setStatus("Error", "analyzing");
+  }
+}
+
+const LABELS = {
+  summary: "📝 Summary",
+  chart: "📊 Chart",
+  answer: "💡 Answer",
+  correction: "⚠️ Correction",
+  ok: "✓ Check",
+  error: "Error",
+};
+
+function fillCard(div, type, text, keyword) {
+  div.className = "card " + type;
+  div.innerHTML = `<small>${LABELS[type] || "Feedback"} · ${new Date().toLocaleTimeString()}</small>`;
+  if (keyword && (type === "correction" || type === "answer")) {
+    const kw = document.createElement("div");
+    kw.className = "kw";
+    kw.textContent = keyword;
+    div.appendChild(kw);
+    div.appendChild(document.createElement("br"));
+  }
+  div.appendChild(document.createTextNode(text));
+}
+
+// ---------- Chart card ----------
+// Draws the numbers directly on the chart (so they show in the saved image too)
+// and paints a white background (saved PNGs are otherwise transparent).
+function valueLabelPlugin(unit, isPie) {
+  const fmt = v => {
+    const n = Number(v);
+    const s = Number.isInteger(n) ? n : n.toFixed(1);
+    return unit === "$" ? "$" + s : s + unit;
+  };
+  return {
+    id: "valueLabels",
+    beforeDraw(chart) {
+      const { ctx, width, height } = chart;
+      ctx.save();
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, width, height);
+      ctx.restore();
+    },
+    afterDatasetsDraw(chart) {
+      const { ctx } = chart;
+      ctx.save();
+      ctx.font = "bold 12px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      chart.data.datasets.forEach((ds, i) => {
+        const meta = chart.getDatasetMeta(i);
+        if (meta.hidden) return;
+        const total = ds.data.reduce((a, b) => a + Number(b), 0);
+        meta.data.forEach((el, j) => {
+          const v = ds.data[j];
+          if (v === null || v === undefined) return;
+          let x, y;
+          if (isPie) {
+            if (total && Number(v) / total < 0.04) return;   // skip tiny slices
+            ({ x, y } = el.tooltipPosition());
+            ctx.fillStyle = "#fff";
+            ctx.strokeStyle = "rgba(0,0,0,.45)";
+            ctx.lineWidth = 3;
+            ctx.strokeText(fmt(v), x, y);
+            ctx.fillText(fmt(v), x, y);
+          } else {
+            x = el.x;
+            y = el.y - 10;
+            ctx.fillStyle = "#333";
+            ctx.fillText(fmt(v), x, y);
+          }
+        });
+      });
+      ctx.restore();
+    },
+  };
+}
+
+const SERIES_COLORS = ["#7048e8", "#e03131", "#2b8a3e", "#f08c00", "#1c7ed6",
+                       "#d6336c", "#0ca678", "#f59f00", "#495057", "#15aabf"];
+
+function fillChart(div, chart, note) {
+  div.className = "card chart";
+  div.innerHTML = `<small>${LABELS.chart} · ${new Date().toLocaleTimeString()}</small>`;
+  const box = document.createElement("div");
+  box.className = "chartbox";
+  const cv = document.createElement("canvas");
+  box.appendChild(cv);
+  div.appendChild(box);
+  if (note) div.appendChild(document.createTextNode(note));
+
+  const isPie = chart.chart_type === "pie";
+  const config = {
+    type: isPie ? "pie" : (chart.chart_type === "bar" ? "bar" : "line"),
+    data: {
+      labels: chart.labels,
+      datasets: chart.datasets.map((d, i) => ({
+        label: d.label,
+        data: d.data,
+        // pie: one color per slice; line/bar: one color per series
+        backgroundColor: isPie
+          ? chart.labels.map((_, j) => SERIES_COLORS[j % SERIES_COLORS.length])
+          : SERIES_COLORS[i % SERIES_COLORS.length] + "88",
+        borderColor: isPie ? "#fff" : SERIES_COLORS[i % SERIES_COLORS.length],
+        borderWidth: 2,
+        tension: 0.3,
+      })),
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        title: { display: !!chart.title, text: chart.title },
+        legend: { position: isPie ? "right" : "top" },
+        tooltip: isPie ? {
+          callbacks: { label: ctx => {
+            const total = ctx.dataset.data.reduce((a, b) => a + Number(b), 0);
+            const pct = (ctx.parsed / total * 100).toFixed(1);
+            return `${ctx.label}: ${ctx.parsed} (${pct}%)`;
+          } }
+        } : {},
+      },
+    },
+  };
+  if (!isPie) {
+    config.options.scales = {
+      x: { title: { display: !!chart.x_label, text: chart.x_label } },
+      y: { title: { display: !!chart.y_label, text: chart.y_label } },
+    };
+  }
+  config.plugins = [valueLabelPlugin(chart.unit || "", isPie)];
+  const chartObj = new Chart(cv, config);
+
+  // "Save image" button: downloads the chart as a PNG
+  const save = document.createElement("button");
+  save.textContent = "⬇ Save image";
+  save.style.cssText = "display:block;margin-top:6px;padding:4px 10px;font-size:12px;background:#7048e8";
+  save.onclick = () => {
+    const a = document.createElement("a");
+    a.href = chartObj.toBase64Image("image/png", 1);
+    a.download = (chart.title || "chart").replace(/\s+/g, "_") + ".png";
+    a.click();
+  };
+  div.appendChild(save);
+}
+</script>
+</body>
+</html>
