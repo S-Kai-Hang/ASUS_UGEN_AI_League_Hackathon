@@ -3,9 +3,6 @@
 
 ## Overview
 
-
-## REQUIREMENTS
-
 **Note Taking Assistant AI** is a project designed to improve the traditional note taking experience by integrating AI-powered assistance. Rather than simply recording information, the system aims to help users understand, organize, and improve their notes in real time.
 
 The project addresses common challenges in note-taking, such as incomplete explanations, inaccurate information, and difficulties creating diagrams or graphs during lectures and meetings.
